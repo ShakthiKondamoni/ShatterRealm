@@ -1,0 +1,801 @@
+#include "UI/SRHUDWidget.h"
+#include "Character/SRHeroGameplayComponent.h"
+#include "Rendering/DrawElements.h"
+#include "Styling/CoreStyle.h"
+#include "Combat/SRCombatComponent.h"
+#include "Debug/SRDebug.h"
+#include "Abilities/SRGameplayAbility.h"
+#include "Abilities/SRGameplayTags.h"
+#include "Data/SRMinimapDataAsset.h"
+#include "UI/SRMinimapWidget.h"
+#include "UI/SRTacticalMapWidget.h"
+#include "Combat/SRWeaponDataAsset.h"
+#include "GAS/PSAttributeSet.h"
+#include "Character/PSBaseCharacter.h"
+#include "GAS/PSPlayerState.h"
+#include "AbilitySystemComponent.h"
+#include "Blueprint/WidgetTree.h"
+#include "Blueprint/WidgetLayoutLibrary.h"
+#include "Components/Border.h"
+#include "Components/CanvasPanel.h"
+#include "Components/CanvasPanelSlot.h"
+#include "Components/Image.h"
+#include "Components/ProgressBar.h"
+#include "Components/SizeBox.h"
+#include "Components/TextBlock.h"
+#include "Engine/World.h"
+#include "EngineUtils.h"
+#include "GameFramework/PlayerController.h"
+#include "Math/UnrealMathUtility.h"
+
+namespace
+{
+const FVector2D SRSlotSize = FVector2D(72.f, 72.f);
+constexpr float SRSlotSpacing = 8.f;
+}
+
+TSharedRef<SWidget> USRHUDWidget::RebuildWidget()
+{
+    UE_LOG(LogTemp, Log, TEXT("[HUD] RebuildWidget: building tree BEFORE Slate creation"));
+    BuildHudTree();
+    BuildSlots();
+    BuildTacticalMap();
+    if (MapPanel) MapPanel->SetVisibility(ESlateVisibility::Collapsed);
+    UE_LOG(LogTemp, Log, TEXT("[HUD] RebuildWidget: tree built, children=%d"), RootCanvas ? RootCanvas->GetChildrenCount() : 0);
+    return Super::RebuildWidget();
+}
+
+void USRHUDWidget::BuildAll()
+{
+    BuildHudTree();
+    BuildSlots();
+    BuildTacticalMap();
+    if (MapPanel) MapPanel->SetVisibility(ESlateVisibility::Collapsed);
+}
+
+void USRHUDWidget::NativeDestruct()
+{
+    UnbindFromCharacter();
+    Super::NativeDestruct();
+}
+
+UTextBlock* USRHUDWidget::MakeText(UPanelWidget* Parent, const FText& Text, const FVector2D& Position, const FVector2D& Size, int32 FontSize, FLinearColor Color)
+{
+    UTextBlock* TextBlock = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), NAME_None);
+    TextBlock->SetText(Text);
+    FSlateFontInfo Font = TextBlock->GetFont();
+    Font.Size = FontSize;
+    TextBlock->SetFont(Font);
+    TextBlock->SetColorAndOpacity(FSlateColor(Color));
+    if (UCanvasPanelSlot* TextSlot = Cast<UCanvasPanelSlot>(Parent->AddChild(TextBlock)))
+    {
+        TextSlot->SetPosition(Position);
+        TextSlot->SetSize(Size);
+        TextSlot->SetAutoSize(false);
+    }
+    return TextBlock;
+}
+
+UProgressBar* USRHUDWidget::MakeBar(UPanelWidget* Parent, const FVector2D& Position, const FVector2D& Size, FLinearColor FillColor)
+{
+    UProgressBar* Bar = WidgetTree->ConstructWidget<UProgressBar>(UProgressBar::StaticClass(), NAME_None);
+    Bar->SetFillColorAndOpacity(FillColor);
+    Bar->SetPercent(1.f);
+    if (UCanvasPanelSlot* BarSlot = Cast<UCanvasPanelSlot>(Parent->AddChild(Bar)))
+    {
+        BarSlot->SetPosition(Position);
+        BarSlot->SetSize(Size);
+    }
+    return Bar;
+}
+
+UImage* USRHUDWidget::MakeMarker(UPanelWidget* Parent, FLinearColor Color, const FVector2D& Size, bool bVisible)
+{
+    UImage* Marker = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(), NAME_None);
+    Marker->SetColorAndOpacity(Color);
+    Marker->SetVisibility(bVisible ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+    if (UCanvasPanelSlot* MarkerSlot = Cast<UCanvasPanelSlot>(Parent->AddChild(Marker)))
+    {
+        MarkerSlot->SetPosition(FVector2D::ZeroVector);
+        MarkerSlot->SetSize(Size);
+        MarkerSlot->SetZOrder(20);
+    }
+    return Marker;
+}
+
+void USRHUDWidget::BuildHudTree()
+{
+    UE_LOG(LogTemp, Log, TEXT("[HUD] BuildHudTree: WidgetTree=%s"), *GetNameSafe(WidgetTree));
+    RootCanvas = WidgetTree->ConstructWidget<UCanvasPanel>(UCanvasPanel::StaticClass(), TEXT("SRRootCanvas"));
+    WidgetTree->RootWidget = RootCanvas;
+    UE_LOG(LogTemp, Log, TEXT("[HUD] BuildHudTree: RootCanvas set"));
+
+    // ---- Bottom-left: hero name, health/shield bars + values, status effects ----
+    HeroNameText = MakeText(RootCanvas, FText::GetEmpty(), FVector2D(40, 16), FVector2D(320, 20), 13, FLinearColor::White);
+    HealthBar = MakeBar(RootCanvas, FVector2D(40, 40), FVector2D(320, 18), FLinearColor(0.05f, 0.75f, 0.1f, 0.9f));
+    ShieldBar = MakeBar(RootCanvas, FVector2D(40, 62), FVector2D(320, 14), FLinearColor(0.1f, 0.5f, 0.95f, 0.9f));
+    HealthValuesText = MakeText(RootCanvas, FText::GetEmpty(), FVector2D(42, 40), FVector2D(320, 18), 11, FLinearColor::White);
+    StatusEffectsText = MakeText(RootCanvas, FText::GetEmpty(), FVector2D(40, 80), FVector2D(320, 16), 10, FLinearColor(1.f, 0.7f, 0.2f));
+
+    // ---- Bottom-right: charges, recharge, weapon name ----
+    ChargesText = MakeText(RootCanvas, FText::GetEmpty(), FVector2D(900, 900), FVector2D(320, 22), 13, FLinearColor::Yellow);
+    RechargeBar = MakeBar(RootCanvas, FVector2D(900, 926), FVector2D(320, 10), FLinearColor(0.95f, 0.6f, 0.05f, 0.9f));
+    RechargeBar->SetPercent(0.f);
+    RechargeText = MakeText(RootCanvas, FText::GetEmpty(), FVector2D(900, 938), FVector2D(320, 16), 10, FLinearColor::White);
+    WeaponNameText = MakeText(RootCanvas, FText::GetEmpty(), FVector2D(900, 958), FVector2D(320, 18), 11, FLinearColor(0.8f, 0.8f, 0.9f));
+
+    // ---- Center: crosshair + hit marker ----
+    CrosshairCenter = MakeMarker(RootCanvas, FLinearColor(1.f, 1.f, 1.f, 0.85f), FVector2D(6, 6), true);
+    if (UCanvasPanelSlot* CrosshairSlot = Cast<UCanvasPanelSlot>(CrosshairCenter->Slot))
+    {
+        CrosshairSlot->SetAnchors(FAnchors(0.5f, 0.5f));
+        CrosshairSlot->SetPosition(FVector2D(-3, -3));
+    }
+    HitMarker = MakeMarker(RootCanvas, FLinearColor(1.f, 0.15f, 0.15f, 1.f), FVector2D(14, 14), false);
+    if (UCanvasPanelSlot* HitSlot = Cast<UCanvasPanelSlot>(HitMarker->Slot))
+    {
+        HitSlot->SetAnchors(FAnchors(0.5f, 0.5f));
+        HitSlot->SetPosition(FVector2D(-7, -7));
+        HitSlot->SetZOrder(20);
+    }
+
+    // ---- Top-right: minimap (direct canvas children, no nested UserWidget) ----
+    constexpr float MMSize = 220.f;
+    constexpr float MMX = -270.f;  // offset from right edge
+    constexpr float MMY = 30.f;
+
+    UBorder* MinimapBg = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), NAME_None);
+    MinimapBg->SetBrushColor(FLinearColor(0.02f, 0.03f, 0.06f, 0.9f));
+    RootCanvas->AddChild(MinimapBg);
+    if (UCanvasPanelSlot* BgSlot = Cast<UCanvasPanelSlot>(MinimapBg->Slot))
+    {
+        BgSlot->SetAnchors(FAnchors(1.f, 0.f));
+        BgSlot->SetPosition(FVector2D(MMX, MMY));
+        BgSlot->SetSize(FVector2D(MMSize, MMSize));
+        BgSlot->SetZOrder(5);
+    }
+
+    // Map image (texture from data asset, or transparent grid placeholder)
+    MapImage = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(), NAME_None);
+    MapImage->SetVisibility(ESlateVisibility::HitTestInvisible);
+    RootCanvas->AddChild(MapImage);
+    if (UCanvasPanelSlot* ImgSlot = Cast<UCanvasPanelSlot>(MapImage->Slot))
+    {
+        ImgSlot->SetAnchors(FAnchors(1.f, 0.f));
+        ImgSlot->SetPosition(FVector2D(MMX, MMY));
+        ImgSlot->SetSize(FVector2D(MMSize, MMSize));
+        ImgSlot->SetZOrder(6);
+    }
+
+    // Player direction arrow
+    LocalPlayerMarker = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(), NAME_None);
+    LocalPlayerMarker->SetColorAndOpacity(FLinearColor(1.f, 1.f, 1.f, 0.95f));
+    RootCanvas->AddChild(LocalPlayerMarker);
+    if (UCanvasPanelSlot* ArrowSlot = Cast<UCanvasPanelSlot>(LocalPlayerMarker->Slot))
+    {
+        ArrowSlot->SetAnchors(FAnchors(1.f, 0.f));
+        ArrowSlot->SetPosition(FVector2D(MMX + MMSize * 0.5f - 6.f, MMY + MMSize * 0.5f - 6.f));
+        ArrowSlot->SetSize(FVector2D(12, 12));
+        ArrowSlot->SetZOrder(15);
+    }
+
+    // Teammate + ping + reveal marker pool
+    for (int32 i = 0; i < 8; ++i)
+    {
+        UImage* M = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(), NAME_None);
+        M->SetVisibility(ESlateVisibility::Collapsed);
+        RootCanvas->AddChild(M);
+        if (UCanvasPanelSlot* MSlot = Cast<UCanvasPanelSlot>(M->Slot))
+        {
+            MSlot->SetAnchors(FAnchors(1.f, 0.f));
+            MSlot->SetSize(FVector2D(8, 8));
+            MSlot->SetZOrder(12);
+        }
+        MapMarkerPool.Add(M);
+    }
+
+    // Centered, resolution-independent compass with moving directional ticks.
+    CompassText = MakeText(RootCanvas, FText::GetEmpty(), FVector2D::ZeroVector, FVector2D(160, 24), 15, FLinearColor::White);
+    if (UCanvasPanelSlot* CompassCanvasSlot = Cast<UCanvasPanelSlot>(CompassText->Slot))
+    {
+        CompassCanvasSlot->SetAnchors(FAnchors(0.5f, 0.f));
+        CompassCanvasSlot->SetAlignment(FVector2D(0.5f, 0.f));
+        CompassCanvasSlot->SetPosition(FVector2D(0.f, 16.f));
+        CompassCanvasSlot->SetZOrder(31);
+    }
+    CompassText->SetJustification(ETextJustify::Center);
+    for (int32 Index = 0; Index < 13; ++Index)
+    {
+        UTextBlock* Label = MakeText(RootCanvas, FText::GetEmpty(), FVector2D::ZeroVector, FVector2D(54, 18), 11,
+            FLinearColor(0.8f, 0.88f, 0.94f, 0.85f));
+        Label->SetJustification(ETextJustify::Center);
+        if (UCanvasPanelSlot* CompassCanvasSlot = Cast<UCanvasPanelSlot>(Label->Slot))
+        {
+            CompassCanvasSlot->SetAnchors(FAnchors(0.5f, 0.f));
+            CompassCanvasSlot->SetAlignment(FVector2D(0.5f, 0.f));
+            CompassCanvasSlot->SetPosition(FVector2D(0.f, 49.f));
+            CompassCanvasSlot->SetZOrder(30);
+        }
+        CompassTicks.Add(Label);
+    }
+    for (int32 Index = 0; Index < 8; ++Index)
+    {
+        UTextBlock* Label = MakeText(RootCanvas, FText::GetEmpty(), FVector2D::ZeroVector, FVector2D(90, 22), 11, FLinearColor::Yellow);
+        Label->SetJustification(ETextJustify::Center);
+        Label->SetVisibility(ESlateVisibility::Collapsed);
+        if (UCanvasPanelSlot* CompassCanvasSlot = Cast<UCanvasPanelSlot>(Label->Slot))
+        {
+            CompassCanvasSlot->SetAnchors(FAnchors(0.5f, 0.f));
+            CompassCanvasSlot->SetAlignment(FVector2D(0.5f, 0.f));
+            CompassCanvasSlot->SetPosition(FVector2D(0.f, 69.f));
+            CompassCanvasSlot->SetZOrder(32);
+        }
+        CompassPingLabels.Add(Label);
+    }
+
+    // Fixed pool of labels for world-anchored team ping locations.
+    for (int32 Index = 0; Index < 16; ++Index)
+    {
+        UTextBlock* MarkerLabel = MakeText(RootCanvas, FText::GetEmpty(),
+            FVector2D::ZeroVector, FVector2D(130.f, 28.f), 14, FLinearColor::Yellow);
+        MarkerLabel->SetJustification(ETextJustify::Center);
+        MarkerLabel->SetVisibility(ESlateVisibility::Collapsed);
+        if (UCanvasPanelSlot* MarkerSlot = Cast<UCanvasPanelSlot>(MarkerLabel->Slot))
+        {
+            MarkerSlot->SetAlignment(FVector2D(0.5f, 1.f));
+            MarkerSlot->SetZOrder(35);
+        }
+        WorldPingLabels.Add(MarkerLabel);
+    }
+
+    // ---- Buff display + debug indicator ----
+    BuffText = MakeText(RootCanvas, FText::GetEmpty(), FVector2D(40, 830), FVector2D(400, 22), 12, FLinearColor::Yellow);
+    DebugIndicatorText = MakeText(RootCanvas, FText::GetEmpty(), FVector2D(40, 1020), FVector2D(300, 20), 10, FLinearColor::Green);
+}
+
+void USRHUDWidget::BuildSlots()
+{
+    if (bSlotsBuilt) return;
+    bSlotsBuilt = true;
+
+    SlotTags[0] = SRGameplayTags::Tag_Input_Ability_Q;
+    SlotTags[1] = SRGameplayTags::Tag_Input_Ability_E;
+    SlotTags[2] = SRGameplayTags::Tag_Input_Ability_C;
+    SlotTags[3] = SRGameplayTags::Tag_Input_Ability_X;
+
+    const TCHAR* Keys[] = { TEXT("Q"), TEXT("E"), TEXT("C"), TEXT("X") };
+    const FLinearColor SlotColors[] = {
+        FLinearColor(0.15f, 0.15f, 0.25f, 0.85f),
+        FLinearColor(0.1f, 0.2f, 0.3f, 0.85f),
+        FLinearColor(0.25f, 0.15f, 0.1f, 0.85f),
+        FLinearColor(0.2f, 0.05f, 0.25f, 0.85f)
+    };
+
+    const float StartX = 520.f;
+    for (int32 Index = 0; Index < 4; ++Index)
+    {
+        const FVector2D Pos(StartX + Index * (SRSlotSize.X + SRSlotSpacing), 900.f);
+
+        UBorder* Background = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), NAME_None);
+        Background->SetBrushColor(SlotColors[Index]);
+        RootCanvas->AddChild(Background);
+        if (UCanvasPanelSlot* BgSlot = Cast<UCanvasPanelSlot>(Background->Slot))
+        {
+            BgSlot->SetPosition(Pos);
+            BgSlot->SetSize(SRSlotSize);
+        }
+
+        SlotWidgets[Index].Background = Background;
+        SlotWidgets[Index].KeyText = MakeText(RootCanvas, FText::FromString(Keys[Index]), Pos + FVector2D(4, 2), FVector2D(64, 14), 10, FLinearColor(0.6f, 0.6f, 0.75f));
+        SlotWidgets[Index].NameText = MakeText(RootCanvas, FText::GetEmpty(), Pos + FVector2D(4, 52), FVector2D(64, 14), 9, FLinearColor(0.85f, 0.85f, 0.95f));
+        SlotWidgets[Index].CooldownFill = MakeBar(RootCanvas, Pos, FVector2D(SRSlotSize.X, SRSlotSize.Y), FLinearColor(0, 0, 0, 0.65f));
+        SlotWidgets[Index].CooldownFill->SetPercent(0.f);
+        SlotWidgets[Index].StatusText = MakeText(RootCanvas, FText::GetEmpty(), Pos + FVector2D(4, 34), FVector2D(64, 16), 10, FLinearColor::White);
+    }
+}
+
+void USRHUDWidget::BuildTacticalMap()
+{
+    MapPanel = WidgetTree->ConstructWidget<UCanvasPanel>(UCanvasPanel::StaticClass(), TEXT("SRMapPanel"));
+    UCanvasPanelSlot* MapSlot = RootCanvas->AddChildToCanvas(MapPanel);
+    MapSlot->SetAnchors(FAnchors(0.f, 0.f, 1.f, 1.f));
+    MapSlot->SetZOrder(50);
+
+    TacticalMapWidget = WidgetTree->ConstructWidget<USRTacticalMapWidget>(USRTacticalMapWidget::StaticClass(), TEXT("SRTacticalMap"));
+    MapPanel->AddChild(TacticalMapWidget);
+    if (UCanvasPanelSlot* TacticalSlot = Cast<UCanvasPanelSlot>(TacticalMapWidget->Slot))
+    {
+        TacticalSlot->SetAnchors(FAnchors(0.5f, 0.5f));
+        TacticalSlot->SetAlignment(FVector2D(0.5f, 0.5f));
+        TacticalSlot->SetAutoSize(true);
+        TacticalSlot->SetZOrder(50);
+    }
+}
+
+void USRHUDWidget::BindToCharacter(APSBaseCharacter* NewCharacter)
+{
+    UnbindFromCharacter();
+    BoundCharacter = NewCharacter;
+    APSPlayerState* State = NewCharacter ? NewCharacter->GetPlayerState<APSPlayerState>() : nullptr;
+    BoundPlayerState = State;
+    if (!NewCharacter || !State) return;
+
+    if (MinimapWidget)
+    {
+        MinimapWidget->MinimapData = MinimapData;
+        MinimapWidget->BindToCharacter(NewCharacter);
+    }
+    if (TacticalMapWidget)
+    {
+        TacticalMapWidget->MinimapData = MinimapData;
+        TacticalMapWidget->BindToPlayerState(State, MinimapData);
+        TacticalMapWidget->SetLocalCharacter(NewCharacter);
+    }
+
+    UAbilitySystemComponent* ASC = NewCharacter->GetAbilitySystemComponent();
+    if (ASC && State->PSAttributes)
+    {
+        HealthHandle = ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetHealthAttribute()).AddUObject(this, &USRHUDWidget::HandleAttributeChanged);
+        ShieldHandle = ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetShieldAttribute()).AddUObject(this, &USRHUDWidget::HandleAttributeChanged);
+        MaxHealthHandle = ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetMaxHealthAttribute()).AddUObject(this, &USRHUDWidget::HandleAttributeChanged);
+        MaxShieldHandle = ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetMaxShieldAttribute()).AddUObject(this, &USRHUDWidget::HandleAttributeChanged);
+        UltimateChargeHandle = ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetUltimateChargeAttribute()).AddUObject(this, &USRHUDWidget::HandleAttributeChanged);
+        MaxUltimateChargeHandle = ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetMaxUltimateChargeAttribute()).AddUObject(this, &USRHUDWidget::HandleAttributeChanged);
+    }
+    if (UPSCombatComponent* Combat = NewCharacter->GetCombatComponent())
+    {
+        Combat->OnChargesChanged.AddDynamic(this, &USRHUDWidget::HandleChargesChanged);
+        Combat->OnRechargeChanged.AddDynamic(this, &USRHUDWidget::HandleRechargeChanged);
+        Combat->OnCombatStateChanged.AddDynamic(this, &USRHUDWidget::HandleCombatStateChanged);
+        Combat->OnHitConfirmed.AddDynamic(this, &USRHUDWidget::HandleHitConfirmed);
+    }
+    NewCharacter->OnTacticalMapToggled.AddUObject(this, &USRHUDWidget::SetTacticalMapVisible);
+
+    RefreshAllValues();
+    RefreshSlotStates();
+    SRDebug::Message(SRDebug::ECategory::HUD, TEXT("Client"), TEXT("HUD bound to hero"), 0.8f, FColor::Green);
+}
+
+void USRHUDWidget::UnbindFromCharacter()
+{
+    if (APSBaseCharacter* Character = BoundCharacter.Get())
+    {
+        if (UAbilitySystemComponent* ASC = Character->GetAbilitySystemComponent())
+        {
+            ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetHealthAttribute()).Remove(HealthHandle);
+            ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetShieldAttribute()).Remove(ShieldHandle);
+            ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetMaxHealthAttribute()).Remove(MaxHealthHandle);
+            ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetMaxShieldAttribute()).Remove(MaxShieldHandle);
+            ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetUltimateChargeAttribute()).Remove(UltimateChargeHandle);
+            ASC->GetGameplayAttributeValueChangeDelegate(UPSAttributeSet::GetMaxUltimateChargeAttribute()).Remove(MaxUltimateChargeHandle);
+        }
+        if (UPSCombatComponent* Combat = Character->GetCombatComponent())
+        {
+            Combat->OnChargesChanged.RemoveAll(this);
+            Combat->OnRechargeChanged.RemoveAll(this);
+            Combat->OnCombatStateChanged.RemoveAll(this);
+            Combat->OnHitConfirmed.RemoveAll(this);
+        }
+        Character->OnTacticalMapToggled.RemoveAll(this);
+    }
+    BoundCharacter.Reset();
+    BoundPlayerState.Reset();
+}
+
+void USRHUDWidget::HandleAttributeChanged(const FOnAttributeChangeData& /*Data*/)
+{
+    RefreshAllValues();
+}
+
+void USRHUDWidget::RefreshAllValues()
+{
+    APSPlayerState* State = BoundPlayerState.Get();
+    if (!State || !State->PSAttributes) return;
+    const UPSAttributeSet* Attributes = State->PSAttributes.Get();
+
+    const float Health = Attributes->GetHealth();
+    const float MaxHealth = FMath::Max(1.f, Attributes->GetMaxHealth());
+    const float Shield = Attributes->GetShield();
+    const float MaxShield = FMath::Max(1.f, Attributes->GetMaxShield());
+    HealthBar->SetPercent(Health / MaxHealth);
+    ShieldBar->SetPercent(Shield / MaxShield);
+    HealthValuesText->SetText(FText::FromString(FString::Printf(TEXT("HP %.0f/%.0f  SH %.0f/%.0f"), Health, MaxHealth, Shield, MaxShield)));
+
+    if (APSBaseCharacter* Character = BoundCharacter.Get())
+    {
+        if (UPSCombatComponent* Combat = Character->GetCombatComponent())
+        {
+            const int32 Charges = Combat->GetDisplayCharges(); // predicted minus in-flight; reconciled by acks
+            const int32 MaxCharges = FMath::Max(1, Combat->GetMaxCharges());
+            ChargesText->SetText(FText::FromString(FString::Printf(TEXT("Charges %d/%d%s"), Charges, MaxCharges, Combat->IsFiring() ? TEXT("  [FIRING]") : TEXT(""))));
+            if (!Combat->IsRecharging())
+            {
+                RechargeBar->SetPercent(0.f);
+                RechargeText->SetText(FText::GetEmpty());
+            }
+        }
+    }
+    RefreshStatusEffects();
+    RefreshSlotStates();
+}
+
+void USRHUDWidget::RefreshStatusEffects()
+{
+    APSBaseCharacter* Character = BoundCharacter.Get();
+    if (!Character) return;
+    FString Status;
+    if (UAbilitySystemComponent* ASC = Character->GetAbilitySystemComponent())
+    {
+        if (ASC->GetTagCount(SRGameplayTags::Tag_Status_Buff_Overcharge) > 0) Status += TEXT("OVERCHARGE  ");
+        if (ASC->HasMatchingGameplayTag(SRGameplayTags::Tag_State_Downed)) Status += TEXT("DOWNED  ");
+        if (ASC->HasMatchingGameplayTag(SRGameplayTags::Tag_State_Stunned)) Status += TEXT("STUNNED  ");
+        if (ASC->HasMatchingGameplayTag(SRGameplayTags::Tag_State_Rooted)) Status += TEXT("ROOTED  ");
+        if (ASC->HasMatchingGameplayTag(SRGameplayTags::Tag_State_Concealed)) Status += TEXT("CONCEALED  ");
+        if (ASC->HasMatchingGameplayTag(SRGameplayTags::Tag_State_Warded)) Status += TEXT("WARDED  ");
+        if (ASC->HasMatchingGameplayTag(SRGameplayTags::Tag_State_TemporalEcho)) Status += TEXT("PARADOX ECHO  ");
+    }
+    if (Character->IsPSSliding()) Status += TEXT("SLIDING  ");
+    if (Character->IsPSTraversing()) Status += TEXT("VAULTING  ");
+    if (Character->IsPSSprinting()) Status += TEXT("SPRINT");
+    StatusEffectsText->SetText(FText::FromString(Status));
+}
+
+void USRHUDWidget::RefreshSlotStates()
+{
+    APSBaseCharacter* Character = BoundCharacter.Get();
+    if (!Character) return;
+    UAbilitySystemComponent* ASC = Character->GetAbilitySystemComponent();
+    const UPSAttributeSet* Attributes = Character->GetPSAttributes();
+    if (!ASC) return;
+
+    for (int32 Index = 0; Index < 4; ++Index)
+    {
+        const FSRSlotWidgets& SlotRef = SlotWidgets[Index];
+        if (!SlotRef.KeyText) continue;
+
+        float Remaining = 0.f;
+        float Duration = 0.f;
+        bool bGranted = false;
+        FString AbilityName;
+        for (const FGameplayAbilitySpec& Spec : ASC->GetActivatableAbilities())
+        {
+            if (!Spec.DynamicAbilityTags.HasTagExact(SlotTags[Index]) || !Spec.Ability) continue;
+            bGranted = true;
+            if (const USRGameplayAbility* SRAbility = Cast<USRGameplayAbility>(Spec.Ability))
+            {
+                AbilityName = SRAbility->AbilityDisplayName.ToString();
+            }
+            if (const FGameplayTagContainer* CooldownTags = Spec.Ability->GetCooldownTags())
+            {
+                const TArray<TPair<float, float>> Times = ASC->GetActiveEffectsTimeRemainingAndDuration(
+                    FGameplayEffectQuery::MakeQuery_MatchAnyOwningTags(*CooldownTags));
+                for (const TPair<float, float>& Time : Times)
+                {
+                    Remaining = FMath::Max(Remaining, Time.Key);
+                    Duration = FMath::Max(Duration, Time.Value);
+                }
+            }
+            break;
+        }
+        if (!bGranted)
+        {
+            SlotRef.NameText->SetText(FText::FromString(TEXT("---")));
+            SlotRef.StatusText->SetText(FText::GetEmpty());
+            SlotRef.CooldownFill->SetPercent(0.f);
+            continue;
+        }
+
+        SlotRef.NameText->SetText(FText::FromString(AbilityName));
+        const bool bReady = Remaining <= 0.f;
+        if (bReady)
+        {
+            SlotRef.StatusText->SetText(FText::FromString(TEXT("READY")));
+            SlotRef.StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(0.3f, 1.f, 0.3f)));
+            SlotRef.CooldownFill->SetPercent(0.f);
+        }
+        else
+        {
+            SlotRef.StatusText->SetText(FormatSecondsText(Remaining));
+            SlotRef.StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(1.f, 0.7f, 0.2f)));
+            SlotRef.CooldownFill->SetPercent(Duration > 0.f ? Remaining / Duration : 0.f);
+        }
+
+        if (Index == 3 && Attributes && bReady)
+        {
+            SlotRef.StatusText->SetText(FText::FromString(FString::Printf(TEXT("%.0f ult"), Attributes->GetUltimateCharge())));
+        }
+    }
+}
+
+FText USRHUDWidget::FormatSecondsText(float Seconds) const
+{
+    return FText::FromString(FString::Printf(TEXT("%.1fs"), FMath::Max(0.f, Seconds)));
+}
+
+FText USRHUDWidget::FacingToCompass(float Yaw) const
+{
+    // UE yaw: +X = 0 (north), +Y = 90 (east). The previous labels were reversed.
+    static const TCHAR* Labels[] = { TEXT("N"), TEXT("NE"), TEXT("E"), TEXT("SE"), TEXT("S"), TEXT("SW"), TEXT("W"), TEXT("NW") };
+    const float Heading = FMath::Fmod(FRotator::NormalizeAxis(Yaw) + 360.f, 360.f);
+    const int32 Index = FMath::RoundToInt(Heading / 45.f) % 8;
+    return FText::FromString(FString::Printf(TEXT("%s  %03d°"), Labels[Index], FMath::RoundToInt(Heading) % 360));
+}
+
+void USRHUDWidget::RefreshCompass(APSBaseCharacter* Character)
+{
+    if (!Character) return;
+    const float Yaw = FMath::Fmod(FRotator::NormalizeAxis(Character->GetControlRotation().Yaw) + 360.f, 360.f);
+    if (CompassText) CompassText->SetText(FacingToCompass(Yaw));
+
+    // Each 15-degree step is 48 pixels; the strip displays +/-90 degrees.
+    constexpr float PixelsPerDegree = 3.2f;
+    const float StartHeading = FMath::FloorToFloat((Yaw - 90.f) / 15.f) * 15.f;
+    for (int32 Index = 0; Index < CompassTicks.Num(); ++Index)
+    {
+        UTextBlock* Label = CompassTicks[Index];
+        if (!Label) continue;
+        const float Heading = StartHeading + Index * 15.f;
+        const float Offset = FMath::FindDeltaAngleDegrees(Yaw, Heading);
+        const bool bInView = FMath::Abs(Offset) <= 90.f;
+        Label->SetVisibility(bInView ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
+        if (!bInView) continue;
+        const int32 Normalized = (FMath::RoundToInt(Heading) % 360 + 360) % 360;
+        const bool bCardinal = Normalized % 45 == 0;
+        static const TCHAR* Directions[] = { TEXT("N"), TEXT("NE"), TEXT("E"), TEXT("SE"), TEXT("S"), TEXT("SW"), TEXT("W"), TEXT("NW") };
+        Label->SetText(FText::FromString(bCardinal ? FString(Directions[Normalized / 45]) : FString::FromInt(Normalized)));
+        Label->SetColorAndOpacity(FSlateColor(bCardinal ? FLinearColor::White : FLinearColor(0.70f, 0.78f, 0.86f, 0.8f)));
+        if (UCanvasPanelSlot* CompassCanvasSlot = Cast<UCanvasPanelSlot>(Label->Slot)) CompassCanvasSlot->SetPosition(FVector2D(Offset * PixelsPerDegree, 49.f));
+    }
+
+    int32 VisiblePings = 0;
+    const APSPlayerState* State = Character->GetPlayerState<APSPlayerState>();
+    if (State)
+    {
+        for (const FSRPingInfo& Ping : State->GetTeamPings())
+        {
+            if (Ping.TeamId != State->TeamId || VisiblePings >= CompassPingLabels.Num()) break;
+            const FVector ToPing = Ping.Location - Character->GetActorLocation();
+            if (ToPing.SizeSquared2D() < 100.f) continue;
+            const float PingYaw = FMath::RadiansToDegrees(FMath::Atan2(ToPing.Y, ToPing.X));
+            const float DeltaYaw = FMath::FindDeltaAngleDegrees(Yaw, PingYaw);
+            if (FMath::Abs(DeltaYaw) > 84.f) continue;
+            UTextBlock* Label = CompassPingLabels[VisiblePings++];
+            if (!Label) continue;
+            const bool bDanger = Ping.Category == SRGameplayTags::Tag_SR_Ping_Danger;
+            const bool bReveal = Ping.Category == SRGameplayTags::Tag_SR_Ping_Reveal;
+            const int32 DistanceM = FMath::RoundToInt(ToPing.Size() / 100.f);
+            Label->SetText(FText::FromString(FString::Printf(TEXT("%s %dm"), bDanger ? TEXT("!") : bReveal ? TEXT("*") : TEXT("◆"), DistanceM)));
+            Label->SetColorAndOpacity(FSlateColor(bDanger ? FLinearColor(1.f, 0.25f, 0.2f) : bReveal ? FLinearColor(1.f, 0.55f, 0.2f) : FLinearColor(1.f, 0.85f, 0.2f)));
+            Label->SetVisibility(ESlateVisibility::HitTestInvisible);
+            if (UCanvasPanelSlot* CompassCanvasSlot = Cast<UCanvasPanelSlot>(Label->Slot)) CompassCanvasSlot->SetPosition(FVector2D(DeltaYaw * PixelsPerDegree, 69.f + (VisiblePings - 1) % 2 * 21.f));
+        }
+    }
+    for (int32 Index = VisiblePings; Index < CompassPingLabels.Num(); ++Index)
+        if (CompassPingLabels[Index]) CompassPingLabels[Index]->SetVisibility(ESlateVisibility::Collapsed);
+}
+
+void USRHUDWidget::RefreshWorldPings(APSBaseCharacter* Character)
+{
+    const APSPlayerState* State = Character ? Character->GetPlayerState<APSPlayerState>() : nullptr;
+    APlayerController* PC = GetOwningPlayer();
+    int32 Used = 0;
+    if (State && PC)
+    {
+        FVector ViewLocation;
+        FRotator ViewRotation;
+        PC->GetPlayerViewPoint(ViewLocation, ViewRotation);
+        for (const FSRPingInfo& Ping : State->GetTeamPings())
+        {
+            if (Ping.TeamId != State->TeamId || Used >= WorldPingLabels.Num()) continue;
+            const FVector ToPing = Ping.Location - ViewLocation;
+            if (FVector::DotProduct(ViewRotation.Vector(), ToPing) <= 0.f) continue;
+            FVector2D ScreenPosition;
+            const FVector WorldPosition = Ping.Location + FVector(0.f, 0.f, 55.f);
+            if (!UWidgetLayoutLibrary::ProjectWorldLocationToWidgetPosition(PC, WorldPosition, ScreenPosition, false)) continue;
+
+            UTextBlock* Marker = WorldPingLabels[Used++];
+            const bool bDanger = Ping.Category == SRGameplayTags::Tag_SR_Ping_Danger;
+            const bool bReveal = Ping.Category == SRGameplayTags::Tag_SR_Ping_Reveal;
+            const int32 DistanceMeters = FMath::RoundToInt(ToPing.Size() / 100.f);
+            Marker->SetText(FText::FromString(FString::Printf(TEXT("%s %dm"),
+                bDanger ? TEXT("! DANGER") : bReveal ? TEXT("* ENEMY") : TEXT("◆ PING"), DistanceMeters)));
+            Marker->SetColorAndOpacity(FSlateColor(bDanger ? FLinearColor(1.f, 0.25f, 0.2f) :
+                bReveal ? FLinearColor(1.f, 0.55f, 0.2f) : FLinearColor(1.f, 0.85f, 0.2f)));
+            Marker->SetVisibility(ESlateVisibility::HitTestInvisible);
+            if (UCanvasPanelSlot* MarkerSlot = Cast<UCanvasPanelSlot>(Marker->Slot))
+                MarkerSlot->SetPosition(ScreenPosition);
+        }
+    }
+    for (int32 Index = Used; Index < WorldPingLabels.Num(); ++Index)
+        if (WorldPingLabels[Index]) WorldPingLabels[Index]->SetVisibility(ESlateVisibility::Collapsed);
+}
+
+void USRHUDWidget::HandleChargesChanged(int32 /*NewCharges*/, int32 /*MaxCharges*/) { RefreshAllValues(); }
+void USRHUDWidget::HandleRechargeChanged(bool /*bIsRecharging*/, float /*RechargeStartTime*/) { RefreshAllValues(); }
+void USRHUDWidget::HandleCombatStateChanged() { RefreshAllValues(); }
+
+void USRHUDWidget::HandleHitConfirmed(int32 ShotId, AActor* HitActor, float Distance, float DamageApplied)
+{
+    HitMarker->SetVisibility(ESlateVisibility::Visible);
+    HitMarkerHideTime = FPlatformTime::Seconds() + 0.15f;
+    SRDebug::Message(SRDebug::ECategory::HUD, TEXT("Client"),
+        FString::Printf(TEXT("Hit marker: %s dist=%.1fm damage=%.0f"), *GetNameSafe(HitActor), Distance / 100.f, DamageApplied), 0.3f, FColor::Green);
+    RefreshAllValues();
+}
+
+void USRHUDWidget::SetTacticalMapVisible(bool bOpen)
+{
+    bTacticalMapOpen = bOpen;
+    if (MapPanel) MapPanel->SetVisibility(bOpen ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+    if (APSBaseCharacter* Character = BoundCharacter.Get()) Character->SetTacticalMapOpen(bOpen);
+    if (APlayerController* PC = GetOwningPlayer())
+    {
+        if (bOpen)
+        {
+            FInputModeGameAndUI InputMode;
+            InputMode.SetWidgetToFocus(TakeWidget());
+            InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+            PC->SetInputMode(InputMode);
+            PC->bShowMouseCursor = true;
+        }
+        else
+        {
+            FInputModeGameOnly InputMode;
+            PC->SetInputMode(InputMode);
+            PC->bShowMouseCursor = false;
+        }
+    }
+    SRDebug::Message(SRDebug::ECategory::TacticalMap, TEXT("Client"), bOpen ? TEXT("Tactical map opened") : TEXT("Tactical map closed"), 0.6f, FColor::Cyan);
+}
+
+void USRHUDWidget::NativeTick(const FGeometry& MyGeometry, float DeltaSeconds)
+{
+    Super::NativeTick(MyGeometry, DeltaSeconds);
+
+    if (HitMarker && HitMarker->GetVisibility() == ESlateVisibility::Visible && FPlatformTime::Seconds() > HitMarkerHideTime)
+    {
+        HitMarker->SetVisibility(ESlateVisibility::Collapsed);
+    }
+
+    if (APSBaseCharacter* Character = BoundCharacter.Get())
+    {
+        if (UPSCombatComponent* Combat = Character->GetCombatComponent())
+        {
+            if (Combat->IsRecharging())
+            {
+                RechargeBar->SetPercent(Combat->GetRechargeProgress01());
+                RechargeText->SetText(FText::FromString(FString::Printf(TEXT("RECHARGING %.0f%%"), Combat->GetRechargeProgress01() * 100.f)));
+            }
+        }
+        if (FPlatformTime::Seconds() >= NextCompassRefresh)
+        {
+            NextCompassRefresh = FPlatformTime::Seconds() + 0.05;
+            RefreshCompass(Character);
+            RefreshWorldPings(Character);
+        }
+        // Minimap marker positions (0.1s interval)
+        static double LastMapUpdate = 0;
+        if (FPlatformTime::Seconds() - LastMapUpdate >= 0.1 && MinimapData)
+        {
+            LastMapUpdate = FPlatformTime::Seconds();
+            const FVector2D Norm = MinimapData->WorldToNormalized(Character->GetActorLocation());
+            constexpr float MMXOff = -270.f, MMYOff = 30.f, MMSize = 220.f;
+            if (LocalPlayerMarker)
+            {
+                LocalPlayerMarker->SetRenderTransformAngle(-Character->GetControlRotation().Yaw);
+                if (UCanvasPanelSlot* MS = Cast<UCanvasPanelSlot>(LocalPlayerMarker->Slot))
+                    MS->SetPosition(FVector2D(MMXOff + Norm.X * MMSize - 6.f, MMYOff + Norm.Y * MMSize - 6.f));
+            }
+            // Teammates
+            int32 TeammateIdx = 0;
+            APSPlayerState* LocalPS = Character->GetPlayerState<APSPlayerState>();
+            if (LocalPS)
+            {
+                for (TActorIterator<APSPlayerState> It(GetWorld()); It; ++It)
+                {
+                    APSPlayerState* Other = *It;
+                    if (!Other || Other == LocalPS || Other->TeamId != LocalPS->TeamId) continue;
+                    const APawn* OtherPawn = Other->GetPawn();
+                    if (!OtherPawn) continue;
+                    const FVector2D OtherNorm = MinimapData->WorldToNormalized(OtherPawn->GetActorLocation());
+                    if (TeammateIdx < MapMarkerPool.Num())
+                    {
+                        if (UImage* M = MapMarkerPool[TeammateIdx])
+                        {
+                            M->SetVisibility(ESlateVisibility::HitTestInvisible);
+                            M->SetColorAndOpacity(FLinearColor(0.2f, 0.7f, 1.f, 0.95f));
+                            if (UCanvasPanelSlot* MS = Cast<UCanvasPanelSlot>(M->Slot))
+                                MS->SetPosition(FVector2D(MMXOff + OtherNorm.X * MMSize - 4.f, MMYOff + OtherNorm.Y * MMSize - 4.f));
+                        }
+                    }
+                    ++TeammateIdx;
+                }
+            }
+            for (int32 i = TeammateIdx; i < MapMarkerPool.Num(); ++i)
+            {
+                if (UImage* M = MapMarkerPool[i]) M->SetVisibility(ESlateVisibility::Collapsed);
+            }
+            // Pings and reveals
+            if (LocalPS)
+            {
+                int32 PingIdx = 0;
+                constexpr int32 PoolStart = 4; // after 4 teammate slots
+                for (const FSRPingInfo& Ping : LocalPS->GetTeamPings())
+                {
+                    if (Ping.TeamId != LocalPS->TeamId) continue;
+                    const int32 PoolIdx = PoolStart + PingIdx;
+                    if (PoolIdx >= MapMarkerPool.Num()) break;
+                    if (UImage* M = MapMarkerPool[PoolIdx])
+                    {
+                        M->SetVisibility(ESlateVisibility::HitTestInvisible);
+                        const FVector2D PN = MinimapData->WorldToNormalized(Ping.Location);
+                        if (UCanvasPanelSlot* MS = Cast<UCanvasPanelSlot>(M->Slot))
+                            MS->SetPosition(FVector2D(MMXOff + PN.X * MMSize - 3.5f, MMYOff + PN.Y * MMSize - 3.5f));
+                        M->SetColorAndOpacity(Ping.Category == SRGameplayTags::Tag_SR_Ping_Danger ? FLinearColor::Red
+                            : Ping.Category == SRGameplayTags::Tag_SR_Ping_Reveal ? FLinearColor(1.f, 0.25f, 0.1f) : FLinearColor::Yellow);
+                    }
+                    ++PingIdx;
+                }
+                for (int32 i = PoolStart + PingIdx; i < MapMarkerPool.Num(); ++i)
+                {
+                    if (UImage* M = MapMarkerPool[i]) M->SetVisibility(ESlateVisibility::Collapsed);
+                }
+            }
+        }
+    }
+
+    const double Now = FPlatformTime::Seconds();
+    if (Now >= SlotRefreshTime)
+    {
+        SlotRefreshTime = Now + 0.25;
+        RefreshSlotStates();
+    }
+}
+
+int32 USRHUDWidget::NativePaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry,
+    const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId,
+    const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
+{
+    int32 Top = Super::NativePaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
+    const APSBaseCharacter* Character = BoundCharacter.Get();
+    if (!Character) return Top;
+    const auto* State = Character->HeroGameplayComponent.Get();
+    const UAbilitySystemComponent* ASC = Character->GetAbilitySystemComponent();
+    const FVector2D Size = AllottedGeometry.GetLocalSize();
+    const FSlateBrush* Brush = FCoreStyle::Get().GetBrush("WhiteBrush");
+    if (State && State->GetBlindStrength() > 0.f)
+        FSlateDrawElement::MakeBox(OutDrawElements, ++Top, AllottedGeometry.ToPaintGeometry(), Brush,
+            ESlateDrawEffect::None, FLinearColor(1.f,1.f,1.f,State->GetBlindStrength()));
+    if (ASC && ASC->HasMatchingGameplayTag(SRGameplayTags::Tag_State_Nearsighted))
+    {
+        const FVector2D Center = Size * 0.5f;
+        const float Radius = FMath::Min(Size.X, Size.Y) * 0.18f;
+        for (int32 Index = 0; Index < 48; ++Index)
+        {
+            const float Y = Size.Y * Index / 48.f;
+            const float NextY = Size.Y * (Index + 1) / 48.f;
+            const float DY = FMath::Abs((Y + NextY) * 0.5f - Center.Y);
+            const float HalfOpening = DY < Radius ? FMath::Sqrt(Radius * Radius - DY * DY) : 0.f;
+            for (int32 Side = 0; Side < 2; ++Side)
+            {
+                const float X = Side == 0 ? 0.f : Center.X + HalfOpening;
+                const float Width = Side == 0 ? Center.X - HalfOpening : Size.X - X;
+                FSlateDrawElement::MakeBox(OutDrawElements, Top + 1,
+                    AllottedGeometry.ToPaintGeometry(FVector2D(Width, NextY - Y + 1.f), FSlateLayoutTransform(FVector2D(X,Y))),
+                    Brush, ESlateDrawEffect::None, FLinearColor(0.015f,0.025f,0.035f,0.97f));
+            }
+        }
+        ++Top;
+    }
+    return Top;
+}
+
+FReply USRHUDWidget::NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
+{
+    if (bTacticalMapOpen && InKeyEvent.GetKey() == EKeys::Escape)
+    {
+        SetTacticalMapVisible(false);
+        return FReply::Handled();
+    }
+    return Super::NativeOnKeyDown(InGeometry, InKeyEvent);
+}
